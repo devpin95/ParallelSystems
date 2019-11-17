@@ -130,7 +130,8 @@ bool ComputeLUDecomposition(float **L, float **U, int n)
 
     bool is_singular = false;   // flag if we encounter a column of all 0's
 
-    int pivot;  // the value to multiply the row by
+    float pivot;  // the value to multiply the row by
+    float pivots[n-1];
     int i;      // the rows we are looking at
     int j;      // the columns that need to be swapped if we pivot
     int k;      // the column we are looking at
@@ -138,7 +139,8 @@ bool ComputeLUDecomposition(float **L, float **U, int n)
     float globalmax;        // the global max for pivoting
     int globalmaxindex;     // the row index of the global max
     float privatemax;       // the max that the thread has encountered
-    int privateindex;       // the index of the thread max (used for max and pivoting)
+    int private_row_index;       // the index of the thread max (used for max and pivoting)
+    int private_column_index;
     float privatetemp;      // the value in the column that needs to be checked as the max
 
     int row_pointer;     // The pointer to the next row that needs to be checked as the max
@@ -146,7 +148,8 @@ bool ComputeLUDecomposition(float **L, float **U, int n)
     int tid;
 
     for ( k = 0; k < n; ++k ) {
-        #pragma omp parallel shared(L, U, globalmax, globalmaxindex, row_pointer, column_pointer) firstprivate(n, k) private(i, j, pivot, privatemax, privateindex, tid)
+        //cout << "Matrix Size: " << n << endl;
+        #pragma omp parallel shared(L, U, globalmax, globalmaxindex, row_pointer, column_pointer, pivots) firstprivate(n, k) private(pivot, privatemax, private_row_index, tid)
         {
             tid = omp_get_thread_num();
             #pragma omp single
@@ -168,23 +171,23 @@ bool ComputeLUDecomposition(float **L, float **U, int n)
             while ( row_pointer < n ) {
                 #pragma omp critical
                 {
-                    privateindex = row_pointer;
+                    private_row_index = row_pointer;
                     ++row_pointer;
                 }
 
                 // check if all of the rows have already been checked
                 // if they have then the thread needs to skip checking the index
-                if ( privateindex >= n ) break;
+                if ( private_row_index >= n ) break;
 
                 // otherwise, we need to get the absolute value of the elements at U[privateindex][k]
-                privatemax = abs(U[privateindex][k]);
+                privatemax = abs(U[private_row_index][k]);
 
                 // now we need to compare it to the global value
                 #pragma omp critical
                 {
                     if ( globalmax < privatemax ) {
                         globalmax = privatemax;
-                        globalmaxindex = privateindex;
+                        globalmaxindex = private_row_index;
                     }
                 }
 
@@ -195,6 +198,8 @@ bool ComputeLUDecomposition(float **L, float **U, int n)
             // make sure none of the threads get past this point until all of the elements in the column have
             // been checked if they are the max
             #pragma omp barrier
+
+            // -----------------------------------------------------------------------------------------------------
 
             // have the master check if the max is 0.0
             // if it is 0.0, then the column is all 0's and the matrix is singular
@@ -214,31 +219,87 @@ bool ComputeLUDecomposition(float **L, float **U, int n)
                     while (column_pointer < n) {
                         #pragma omp critical
                         {
-                            privateindex = column_pointer;
+                            private_column_index = column_pointer;
                             ++column_pointer;
                         }
 
                         // check if all of the rows have already been checked
                         // if they have then the thread needs to skip checking the index
-                        if (privateindex >= n) break;
+                        if (private_column_index >= n) break;
 
                         // swap the current row with the row with the max value
-                        float top = U[k][privateindex];
-                        float bottom = U[globalmaxindex][privateindex];
-                        U[k][privateindex] = bottom;
-                        U[globalmaxindex][privateindex] = top;
-
-
-                        // check the column pointer at the end so that the thread doesnt go back through
-                        // we dont need to worry about a critical section because we also check it at the beginning
+                        float top = U[k][private_column_index];
+                        float bottom = U[globalmaxindex][private_column_index];
+                        U[k][private_column_index] = bottom;
+                        U[globalmaxindex][private_column_index] = top;
                     }
+                }
+
+                #pragma omp barrier
+
+                // -----------------------------------------------------------------------------------------------------
+                // Now subtract each row by the pivot
+                #pragma omp single
+                {
+                    //cout << "Pivots" << endl;
+                    row_pointer = k + 1;
+                }
+
+                while ( row_pointer < n ) {
+                    #pragma omp critical
+                    {
+                        private_row_index = row_pointer;
+                        ++row_pointer;
+
+                        //if ( private_row_index < n ) cout << "Thread " << tid << " gets row " << private_row_index << endl;
+                    }
+
+                    if ( private_row_index >= n ) break;
+
+                    float sign = 1.0;
+                    if ( U[private_row_index][k] < 0.0 ) {
+                        sign = -sign;
+                    }
+
+                    L[private_row_index][k] = sign * (U[private_row_index][k] / U[k][k]);
+                }
+
+                #pragma omp barrier
+
+                // -----------------------------------------------------------------------------------------------------
+
+                // Now subtract each row by the pivot
+                #pragma omp single
+                {
+                    column_pointer = k;
+                    row_pointer = k + 1;
+                    //cout << "Starting [" << row_pointer << "][" << column_pointer << "]" << endl;
+                }
+
+                while ( row_pointer < n ) {
+                    #pragma omp critical
+                    {
+                        //pivot = U[row_pointer][column_pointer] / U[k][k];
+                        private_column_index = column_pointer;
+                        private_row_index = row_pointer;
+                        //if ( row_pointer < n ) cout << "Thread " << tid << " gets [" << private_column_index << "][" << private_row_index << "]" << endl;
+
+                        ++column_pointer;
+
+                        if ( column_pointer >= n ) {
+                            column_pointer = k;
+                            ++row_pointer;
+                        }
+                    }
+
+                    if ( private_row_index >= n ) break;
+
+                    pivot = L[private_row_index][k];
+                    U[private_row_index][private_column_index] = U[private_row_index][private_column_index] - (pivot * U[k][private_column_index]);
                 }
             }
 
-//            #pragma omp single
-//            {
-//                cout << "Column " << k << " max " << globalmax << " in row " << globalmaxindex << endl;
-//            }
+            #pragma omp barrier
         }
     }
 
@@ -272,9 +333,9 @@ int main(int argc, char *argv[])
 //
 //        cout<< "The L matrix" << endl;
 //        PrintMatrix(L,n);
-
-        cout<< "The U matrix" << endl;
-        PrintMatrix(U,n);
+//
+//        cout<< "The U matrix" << endl;
+//        PrintMatrix(U,n);
 	}
 
 	runtime = omp_get_wtime();
@@ -289,8 +350,11 @@ int main(int argc, char *argv[])
 		//The eliminated matrix is as below:
 		if (isPrintMatrix)
 		{
-			cout<< "Output matrix:" << endl;
-			PrintMatrix(U,n);
+            cout<< "The L matrix" << endl;
+            PrintMatrix(L,n);
+
+            cout<< "The U matrix" << endl;
+            PrintMatrix(U,n);
 		}
 
 		//print computing time
